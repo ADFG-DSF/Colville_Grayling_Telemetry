@@ -16,7 +16,7 @@ library(jagsUI)
 library(jagshelper)
 library(tidyverse)
 
-load("flight_data.Rdata")
+load("data/flight_data.Rdata")
 ```
 
 ## Linking sequential observations
