@@ -1,0 +1,615 @@
+---
+title: "Colville Grayling - additional analysis"
+author: "Matt Tyers"
+date: "2024-01-09"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, dpi=300)
+```
+
+```{r, message=FALSE, warning=FALSE}
+## loading all data and filling in all necessary calculations...
+library(riverdist)
+library(jagsUI)
+library(jagshelper)
+library(tidyverse)
+
+load("flight_data.Rdata")
+```
+
+## Linking sequential observations
+
+Just to satisfy my own curiosity after looking at the report figures, I tried developing a new plotting function that I might try including with riverdist.  For each sequential pair of surveys, it draws points for both surveys with lines connecting each individual fish (blue for net upstream movement, red for net downstream movement).
+
+```{r, fig.width=9, fig.height=12, warning=FALSE}
+## lineplot, linked by paired observations
+# flight_data has all the things
+# telem_albers has raw xy telemetry data
+
+# defining function to extract xy coords from seg-vert(river)
+# might include this in riverdist
+segvert2xy <- function(seg, vert, rivers) {
+  if (!inherits(rivers, "rivernetwork"))
+    stop("Argument 'rivers' must be of class 'rivernetwork'.  See help(line2network) for more information.")
+  lines <- rivers$lines
+  if (max(seg, na.rm = T) > length(lines) | min(seg, na.rm = T) <
+      1)
+    stop("Invalid segment numbers specified.")
+  x <- y <- rep(NA, length(seg))
+  for (i in 1:length(seg)) {
+    x[i] <- lines[[seg[i]]][vert[i], 1]
+    y[i] <- lines[[seg[i]]][vert[i], 2]
+  }
+  return(data.frame(x=x,y=y))
+}
+the_xy <- segvert2xy(seg=flight_data$seg, vert=flight_data$vert, rivers=Colville4)
+flight_data$x <- the_xy$x
+flight_data$y <- the_xy$y
+flight_data$md <- mouthdist(seg=flight_data$seg, vert=flight_data$vert, rivers=Colville4)
+
+x_wider <- pivot_wider(flight_data, names_from = Survey, values_from=x, id_cols=`Unique..`) %>% as.data.frame
+y_wider <- pivot_wider(flight_data, names_from = Survey, values_from=y, id_cols=`Unique..`) %>% as.data.frame
+md_wider <- pivot_wider(flight_data, names_from = Survey, values_from=md, id_cols=`Unique..`) %>% as.data.frame
+
+# actually doing the paired thing
+allsurveys <- sort(unique(flight_data$Survey))
+par(mfrow=c(3,3))
+for(i_survey in 2:length(allsurveys)) {
+  # x0 <- flight_data$x[flight_data$Survey==allsurveys[i_survey-1]]
+  # y0 <- flight_data$y[flight_data$Survey==allsurveys[i_survey-1]]
+  # x1 <- flight_data$x[flight_data$Survey==allsurveys[i_survey]]
+  # y1 <- flight_data$y[flight_data$Survey==allsurveys[i_survey]]
+
+  # x0 <- ifelse(flight_data$Survey==allsurveys[i_survey-1], flight_data$x, NA)
+  # y0 <- ifelse(flight_data$Survey==allsurveys[i_survey-1], flight_data$y, NA)
+  # x1 <- ifelse(flight_data$Survey==allsurveys[i_survey], flight_data$x, NA)
+  # y1 <- ifelse(flight_data$Survey==allsurveys[i_survey], flight_data$y, NA)
+
+  x0 <- x_wider[,i_survey]
+  x1 <- x_wider[,i_survey+1]
+  y0 <- y_wider[,i_survey]
+  y1 <- y_wider[,i_survey+1]
+
+  thecol <- adjustcolor(ifelse(md_wider[,i_survey] - md_wider[,i_survey+1] < 0, 4, 2), alpha=.6)
+  thelegend <- paste0(c("Net Upstream (n = ", "Net Downstream (n = "),
+                      c(sum(md_wider[,i_survey] - md_wider[,i_survey+1] < 0, na.rm=T),
+                        sum(md_wider[,i_survey] - md_wider[,i_survey+1] > 0, na.rm=T)),
+                      rep(")", 2))
+
+  plot(Colville4, empty=TRUE, linecol="grey", main=paste(allsurveys[i_survey-1],"to",allsurveys[i_survey]))
+  points(x0, y0)
+  points(x1, y1, pch=16)
+
+  # themouthdist <- mouth
+  #
+  arrows(x0=x0, x1=x1, y0=y0, y1=y1, col=thecol, length=.05, lwd=2)
+  legend("topleft",lwd=2,col=c(4,2),legend=thelegend)
+}
+```
+
+\pagebreak
+
+## Modeling survival
+
+With the relatively high rates of mortality observed in this study and relatively high rates of detection of individual fish, I couldn't help myself and had to try applying the Bayesian survival model I developed for the Tanana Burbot telemetry project.  Given the description of grayling as a migratory fish that utilizes seasonally available habitats, I was mainly curious if we could show that the more migratory individuals had a better shot at survival.  
+
+In developing the model, I tried all possible combinations of the following explanatory variables:
+
+* River reach most often occupied (defined from Located_3 in the data spreadsheet)
+* Length (defined as both numeric and binned)
+* Cumulative distance per day elapsed (binned)
+* Cumulative distance per observation interval (binned)
+
+Models were compared using DIC scores, and the final model included a linear relationship between length (numeric) and the log-odds of survival, and categorical effects of cumulative distance per observation (binned).
+
+### Unpacking the model (hooray for copy-paste)
+
+The probability of survival $p_{ij}$ for individual $i$ corresponding to the period of time between flights $j-1$ and $j$ was estimated using a Bayesian state-space model.  The state matrix $X$ was defined with rows corresponding to each instrumented grayling and columns corresponding to each time period.  $X_{i,j}$ was given a value of 1 if individual $i$ was observed to be alive at time $j$, a value of 0 if it was observed to be dead, and NA if it was not observed.
+
+When appropriate, values of 1 and 0 were imputed algorithmically when the state of an instrumented grayling could be logically inferred.  State variable $X_{i,j}$ was given a value of 1 for all time periods $j$ from instrumentation to the last time it was observed to be alive; conversely, $X_{i,j}$ was given a value of 0 for all time periods after it was first observed to be dead.
+
+Each element of the state matrix $X$ was modeled as a Binomial random variable with a probability parameter associated with the time period, and size parameter of 1 or 0 depending on the state at the previous time period; that is,
+
+$$X_{i,j} \sim Binom(p_{ij}, X_{i,j-1}) 
+\begin{matrix}
+i \in 1...n \\
+j \in 1 ...m_i
+\end{matrix}$$
+
+in which $p_{ij}$ can be interpreted as the probability of survival of individual $i$ from time periods $j-1$ and $j$, $n$ is the number of instrumented grayling, and $m_i$ denotes the first time period individual $i$ was observed to be dead (or final flight).
+This state-space model formulation allowed state variable $X_{i,j}$ to be treated as an unknown parameter to be modeled, if the state were unknown (that is, a value of NA) for a given individual and time period, therefore incorporating more information in estimating survival probabilities.
+
+Survival probabilities for each individual at each time step were modeled as a function of the baseline odds of survival associated with each time step, and adjustments associated with explanatory variables.  Several candidate models were constructed and fit, and compared according to deviance information criterion (DIC), posterior predictive accuracy, and model interpretability.  The final model was simplified to:
+
+$$log\left(\frac{p_{ij}}{1-p_{ij}}\right) = \gamma_{j-1}+\beta L_i+\tau_{z[i]}$$
+
+in which: 
+
+* $exp(\gamma_{j-1})$ can be interpreted as the baseline odds of survival between time periods $j-1$ and $j$, or alternately,
+* $\frac{exp(\gamma_{j-1})}{1+exp(\gamma_{j-1})}$ can be interpreted as the baseline probability of survival between time periods $j-1$ and $j$
+* $L_i$ denotes length (FL) of fish $i$
+* $\beta$ may be interpreted as the linear relationship between length and log-odds of survival
+* $z[i]$ represents the (binned) migratory category, calculated from the cumulative distance traveled per observation interval, and 
+* $exp(\tau_h)$ may be interpreted as a multiplicative adjustment on the survival odds associated with the migratory category $h$.
+
+A zero-sum constraint was employed on the migratory category effects instead of a typical reference-level parameterization, such that the baseline odds parameters $\tau_{\in 1...n_{\tau}}$ could be globally interpreted.  This was done with the following priors:
+
+$$\tau_{\in 1...(n_{\tau}-1)} \sim N(0,10)$$
+
+$$\tau_{n_{\tau}}=-\sum \tau_{\in 1...(n_{\tau}-1)}$$
+
+Similarly, a zero-sum constraint was employed on the length relationship by subtracting the mean length from the vector of lengths.  The regression parameter $\beta$ was similarly given a diffuse Normal prior:
+
+$$\beta \sim N(0,10)$$
+
+Diffuse Normal priors were also used on the baseline odds parameters, according to the form below.  It should be noted that the prior variances are sufficiently diffuse when used on the logit scale.
+
+$$\gamma_{\in 1...n_{\gamma}} \sim N(0,10)$$
+
+Estimation was performed using Markov Chain Monte Carlo (MCMC) within program JAGS (Plummer, 2003), called within R using packages 'jagsUI' (Kellner, 2021) and 'jagshelper' (Tyers, 2023).  Ten chains of 100,000 MCMC samples were taken, with the first half discarded as warm-up and thinning to every 50th sample.  Convergence was assessed graphically and using a minimum value of Gelman-Rubin Convergence Diagnostic of $\hat{R}<1.01$.
+
+### Some references
+
+Gelman, A., & Rubin, D. B. (1992). Inference from Iterative Simulation Using Multiple Sequences. Statistical Science, 7(4), 457–472. http://www.jstor.org/stable/2246093
+
+Kellner K (2021). _jagsUI: A Wrapper Around 'rjags' to Streamline 'JAGS'
+  Analyses_. R package version 1.5.2, <https://CRAN.R-project.org/package=jagsUI>.
+
+R Core Team (2023). _R: A Language and Environment for Statistical Computing_. R
+  Foundation for Statistical Computing, Vienna, Austria.
+  <https://www.R-project.org/>.
+  
+  Tyers M (2022). _jagshelper: Extracting and Visualizing Output from 'jagsUI'_. R
+  package version 0.1.11, <https://CRAN.R-project.org/package=jagshelper>
+  
+  Tyers M (2023). _riverdist: River Network Distance Computation and Applications_.
+  R package version 0.16.1, <https://cran.r-project.org/package=riverdist>.
+  
+```{r, message=FALSE, warning=FALSE, results='hide'}
+# Making a wide-format table for all these variables:
+# Length Tagging_Location Located_1 Located_2 Located_3
+length_wider <- pivot_wider(flight_data, names_from = Survey, values_from=Length, id_cols=`Unique..`) %>% as.data.frame
+tag_wider <- pivot_wider(flight_data, names_from = Survey, values_from=Tagging_Location, id_cols=`Unique..`) %>% as.data.frame
+loc1_wider <- pivot_wider(flight_data, names_from = Survey, values_from=Located_1, id_cols=`Unique..`) %>% as.data.frame
+loc2_wider <- pivot_wider(flight_data, names_from = Survey, values_from=Located_2, id_cols=`Unique..`) %>% as.data.frame
+loc3_wider <- pivot_wider(flight_data, names_from = Survey, values_from=Located_3, id_cols=`Unique..`) %>% as.data.frame
+
+# defining a function to extract the mode of a vector
+themode <- function(x) unname(names(sort(table(x), decreasing=T))[1])
+
+# grabbing the mode of all the _wider rows
+# this will make a vector corresponding to all tagged individuals
+length_id <- length_wider[,2]
+tag_id <- apply(tag_wider, 1, function(x) themode(as.character(x)[-1]))
+loc1_id <- apply(loc1_wider, 1, function(x) themode(as.character(x)[-1]))
+loc2_id <- apply(loc2_wider, 1, function(x) themode(as.character(x)[-1]))
+loc3_id <- apply(loc3_wider, 1, function(x) themode(as.character(x)[-1]))
+
+# will need by-indiv vectors of migratory behavior:
+# might even restrict this to the first 4(ish) events??
+# - homerange
+# - cumulative distance (per survey)
+## describe seasonal distributions and migrations (this will be the big one)
+## INVESTIGATING CALCULATING A SUMMARY METRIC OF TRAVEL FOR EACH INDIVIDUAL
+## (such that there is one value for each individual)
+
+# - calculating minimum homerange for each individual
+hr_mt <- homerange(unique=flight_data$Unique..,
+                survey=flight_data$Survey,
+                seg=flight_data$seg,
+                vert=flight_data$vert,
+                rivers=Colville4)
+hr_table <- hr_mt$ranges  # extracting table of homeranges
+hr_table$range <- hr_table$range/1000  # converting to km
+# hist(hr_table$range, main="", xlab="Minimum homerange (km)")
+
+# # looking at the locations of the top mover (seems reasonable)
+# hr_table[which.max(hr_table$range),]
+# par(mfrow=c(1,1))
+# plot(Colville4)
+# riverpoints(seg=flight_data$seg[flight_data$Unique..==65],
+#             vert=flight_data$vert[flight_data$Unique..==65],
+#             rivers=Colville4, pch=16)
+
+
+
+
+## what if we did total observed distance INSTEAD of homerange?
+## this is defined as the absolute distance between each possible pairing of
+## sequential observations (or non-sequential if individual was not observed)
+
+# to calculate, for each individual:
+# - subset
+# - sort by date
+# - calculate non-missing distances sequentially
+indiv <- sort(unique(flight_data$Unique..))
+nobs <- cumuldist <- ndays <- rep(NA, length(indiv))
+for(i in 1:length(indiv)) {
+  # print(i)
+  d1 <- flight_data[flight_data$Unique..==indiv[i],]
+  d2 <- d1[order(d1$Survey),]
+  nobs[i] <- nrow(d2)  # number of observations per individual
+  ndays[i] <- d2$Date %>% range %>% diff %>% as.numeric  # total number of elapsed days
+  cumuldist[i] <- 0
+  if(nrow(d2)>1) {
+    for(irow in 2:nrow(d2)) {
+      cumuldist[i] <- cumuldist[i] + riverdistance(startseg=d2$seg[irow-1],
+                                                   startvert=d2$vert[irow-1],
+                                                   endseg=d2$seg[irow],
+                                                   endvert=d2$vert[irow],
+                                                   rivers=Colville4)/1000 # make it km
+    }
+  }
+}
+dtab <- data.frame(nobs, ndays, cumuldist)  # bundle summary metrics
+rownames(dtab) <- indiv
+
+# ## exploratory plots to look at behavior of possible summary metrics
+# # cumulative distance
+# hist(dtab$cumuldist)
+# plot(nobs, cumuldist)
+# boxplot(cumuldist~nobs)
+
+# # cumulative distance per possible pair of observations
+# hist(cumuldist/(nobs-1))
+# plot(nobs, cumuldist/(nobs-1))
+# boxplot(cumuldist/(nobs-1) ~ nobs)  # seems consistent enough to use as metric
+# 
+# # cumulative distance per day
+# boxplot(cumuldist/ndays ~ nobs)  # less consistent, one big outlier
+# hist(cumuldist/ndays, breaks=10)
+
+## ok, bundle all summary metrics
+dtab$dist_per_obs <- dtab$cumuldist/(dtab$nobs-1)   # distance per pair of observations
+dtab$dist_per_day <- dtab$cumuldist/ndays
+# this is a little awkward, have to include individuals with zero homerange
+dtab$homerange <- 0
+for(i in 1:nrow(hr_table)) dtab$homerange[rownames(dtab)==hr_table$ID[i]] <- hr_table$range[i]
+
+
+# # start plotting stuff!
+# par(mfrow=c(2,2))
+# plot(dtab$homerange ~ length_id)
+# plot(dtab$cumuldist ~ length_id)
+# plot(dtab$dist_per_obs ~ length_id)
+# plot(dtab$dist_per_day ~ length_id)
+# 
+# par(mfrow=c(2,2))
+# par(mar=c(6,4,3,2))
+# boxplot(dtab$homerange ~ tag_id, las=2, xlab="")
+# boxplot(dtab$cumuldist ~ tag_id, las=2, xlab="")
+# boxplot(dtab$dist_per_obs ~ tag_id, las=2, xlab="")
+# boxplot(dtab$dist_per_day ~ tag_id, las=2, xlab="")
+# 
+# par(mfrow=c(2,2))
+# par(mar=c(7,4,3,2))
+# boxplot(dtab$homerange ~ loc1_id, las=2, xlab="")
+# boxplot(dtab$cumuldist ~ loc1_id, las=2, xlab="")
+# boxplot(dtab$dist_per_obs ~ loc1_id, las=2, xlab="")
+# boxplot(dtab$dist_per_day ~ loc1_id, las=2, xlab="")
+# 
+# par(mfrow=c(2,2))
+# par(mar=c(7,4,3,2))
+# boxplot(dtab$homerange ~ loc2_id, las=2, xlab="")
+# boxplot(dtab$cumuldist ~ loc2_id, las=2, xlab="")
+# boxplot(dtab$dist_per_obs ~ loc2_id, las=2, xlab="")
+# boxplot(dtab$dist_per_day ~ loc2_id, las=2, xlab="")
+# 
+# par(mfrow=c(2,2))
+# par(mar=c(7,4,3,2))
+# boxplot(dtab$homerange ~ loc3_id, las=2, xlab="")
+# boxplot(dtab$cumuldist ~ loc3_id, las=2, xlab="")
+# boxplot(dtab$dist_per_obs ~ loc3_id, las=2, xlab="")
+# boxplot(dtab$dist_per_day ~ loc3_id, las=2, xlab="")
+
+# will also need survival matrix
+# AND fixed survival matrix
+status_wider <- pivot_wider(flight_data, names_from = Survey, values_from=Status, id_cols=`Unique..`) %>% as.data.frame
+surv <- status_wider[,-(1:2)]
+for(j in 1:ncol(surv)) {
+  surv[,j] <- as.numeric(surv[,j]=="A")
+}
+surv <- cbind(1,surv)
+
+# now imputing ones or zeroes when it can be logically determined
+for(i in 1:nrow(surv)) {
+  which1 <- which(surv[i,]==1)
+  which0 <- which(surv[i,]==0)
+  if(length(which1) > 0) surv[i, 1:max(which1)] <- 1
+  if(length(which0) > 0) surv[i, min(which0):ncol(surv)] <- 0
+}
+
+make_tottable <- function(x) {
+  # t(apply(x,2,table))#, useNA="ifany"))
+  mat <- matrix(ncol=2, nrow=ncol(x))
+  for(i in 1:ncol(x)) {
+    mat[i,1] <- sum(x[,i]==0, na.rm=T)
+    mat[i,2] <- sum(x[,i]==1, na.rm=T)
+  }
+  rownames(mat) <- colnames(x)
+  colnames(mat) <- c("0","1")
+  return(mat)
+}
+# par(mfrow=c(1,1))
+# mosaicplot(make_tottable(surv), main="all fish")
+
+makeplotswith <- function(x) {
+  surv <- surv[!is.na(x),]
+  x <- x[!is.na(x)]
+
+  for(i in 1:length(unique(x))) {
+    thisone <- sort(unique(x))[i]
+    mosaicplot(make_tottable(surv[x==thisone,]),
+               main=paste(thisone, "n =",sum(x==thisone)))
+  }
+
+  tbls <- list()
+  for(i in 1:length(unique(x))) {
+    thisone <- sort(unique(x))[i]
+    tbls[[i]] <- make_tottable(surv[x==thisone,])
+  }
+  plot(NA, xlim=c(1,10),ylim=c(0,1))
+  for(i in 1:length(unique(x))) lines(tbls[[i]][,2]/rowSums(tbls[[i]]), col=i, lwd=2)
+  legend("topright", lwd=2, col=1:length(unique(x)), legend=sort(unique(x)))
+}
+
+# par(mfrow=c(2,3))
+# makeplotswith(x=loc3_id)
+# par(mfrow=c(2,3))
+# makeplotswith(x=loc2_id)
+# par(mfrow=c(2,3))
+# makeplotswith(x=cut(length_id, breaks=c(310,330,350,370,430)))
+# par(mfrow=c(2,3))
+# makeplotswith(x=cut(dtab$dist_per_day, breaks=c(0,.2,.4,.6,1)))
+# par(mfrow=c(2,3))
+# makeplotswith(x=cut(dtab$dist_per_obs, breaks=c(0,25,50,100,200)))
+
+# par(mfrow=c(2,3))
+# makeplotswith(x=cut(dtab$homerange/(dtab$nobs-1),
+#                     breaks=c(0,20,50,100,200)))
+
+
+### yes we could look at relationships between size/loc and movingness
+
+# par(mfrow=c(1,1))
+# mosaicplot(table(loc3_id, cut(dtab$dist_per_day, breaks=c(0,.2,.4,.6,1))),
+#            color=rev(grey.colors(4)), ylab="km per day")
+# mosaicplot(table(loc3_id, cut(dtab$dist_per_obs, breaks=c(0,25,50,100,200))),
+#            color=rev(grey.colors(4)), ylab="km per obs")
+# mosaicplot(table(cut(length_id, breaks=c(310,330,350,370,430)),
+#                  cut(dtab$dist_per_day, breaks=c(0,.2,.4,.6,1))),
+#            color=rev(grey.colors(4)), ylab="km per day")
+# mosaicplot(table(loc3_id, cut(dtab$dist_per_day, breaks=c(0,.2,.4,.6,1))),
+#            color=rev(grey.colors(4)))
+
+# mosaicplot(table(loc2_id, cut(dtab$dist_per_day, breaks=c(0,.2,.4,.6,1))))
+# mosaicplot(table(tag_id, cut(dtab$dist_per_day, breaks=c(0,.2,.4,.6,1))))
+
+
+## survival model, motivated by above
+library(jagsUI)
+library(jagshelper)
+
+# still need firstdead
+firstdead <- rep(NA, nrow(surv))
+for(i in 1:nrow(surv)) {
+  firstdead[i] <- ifelse(!any(surv[i,]==0, na.rm=T),
+                         ncol(surv),
+                         which.max(surv[i,]==0))
+}
+
+# make appropriate cut variables: lengthcut, dist_obs, dist_day, homerange
+lengthcut <- cut(length_id, breaks=c(310,330,350,370,430))
+dist_obs <- cut(dtab$dist_per_obs, breaks=c(0,25,50,100,200))
+dist_day <- cut(dtab$dist_per_day, breaks=c(0,.2,.4,.6,1))
+sectionmode <- loc3_id
+
+### TRYING A MORE STRUCTURED APPROACH TO MODEL SELECTION
+# bundle data to pass into JAGS
+surv_vbls_data <- list(survtable=surv,
+                       firstdead=firstdead,
+                       # firstpresent=firstpresent,
+                       n=nrow(surv),
+                       np=ncol(surv)-1,
+                       sectionmode=as.numeric(as.factor(sectionmode)),
+                       n_section=length(unique(sectionmode)),
+                       lengthcut=as.numeric(as.factor(lengthcut)),
+                       n_length=length(levels(lengthcut)),
+                       length=length_id - mean(length_id, na.rm=T),
+                       dist_obs=as.numeric(as.factor(dist_obs)),
+                       n_dist_obs=length(levels(dist_obs)),
+                       dist_day=as.numeric(as.factor(dist_day)),
+                       n_dist_day=length(levels(dist_day)))
+
+## taking out blank distance things
+surv_vbls_data$survtable <- surv_vbls_data$survtable[!is.na(dist_obs),]
+surv_vbls_data$firstdead <- surv_vbls_data$firstdead[!is.na(dist_obs)]
+# surv_vbls_data$firstpresent <- surv_vbls_data$firstpresent[!is.na(lengthcut)]
+surv_vbls_data$sectionmode <- surv_vbls_data$sectionmode[!is.na(dist_obs)]
+surv_vbls_data$lengthcut <- surv_vbls_data$lengthcut[!is.na(dist_obs)]
+surv_vbls_data$length <- surv_vbls_data$length[!is.na(dist_obs)]
+surv_vbls_data$dist_day <- surv_vbls_data$dist_day[!is.na(dist_obs)]
+surv_vbls_data$dist_obs <- surv_vbls_data$dist_obs[!is.na(dist_obs)]
+surv_vbls_data$n <- sum(!is.na(dist_obs))
+
+# ## taking out blank distance things AND section=Other
+# surv_vbls_data$survtable <- surv_vbls_data$survtable[!is.na(dist_obs) & as.numeric(as.factor(sectionmode)) < 5,]
+# surv_vbls_data$firstdead <- surv_vbls_data$firstdead[!is.na(dist_obs) & as.numeric(as.factor(sectionmode)) < 5]
+# # surv_vbls_data$firstpresent <- surv_vbls_data$firstpresent[!is.na(lengthcut)]
+# surv_vbls_data$sectionmode <- surv_vbls_data$sectionmode[!is.na(dist_obs) & as.numeric(as.factor(sectionmode)) < 5]
+# surv_vbls_data$lengthcut <- surv_vbls_data$lengthcut[!is.na(dist_obs) & as.numeric(as.factor(sectionmode)) < 5]
+# surv_vbls_data$length <- surv_vbls_data$length[!is.na(dist_obs) & as.numeric(as.factor(sectionmode)) < 5]
+# surv_vbls_data$dist_day <- surv_vbls_data$dist_day[!is.na(dist_obs) & as.numeric(as.factor(sectionmode)) < 5]
+# surv_vbls_data$dist_obs <- surv_vbls_data$dist_obs[!is.na(dist_obs) & as.numeric(as.factor(sectionmode)) < 5]
+# surv_vbls_data$n <- sum(!is.na(dist_obs) & as.numeric(as.factor(sectionmode)) < 5)
+# surv_vbls_data$n_section=length(unique(surv_vbls_data$sectionmode))
+
+# JAGS controls
+niter <- 100*1000
+ncores <- min(10, parallel::detectCores()-1)  # number of cores to use
+
+
+## Model 8: length (num) and dist per obs
+surv_vbls_jags <- tempfile()
+cat('model {
+  for(i in 1:n) {
+    for(j in 2:firstdead[i]) {          # for each survey
+      # survtable[i,j] ~ dbin(p[j-1], survtable[i,j-1])   # for each event present
+      survtable[i,j] ~ dbin(p[i,j], survtable[i,j-1])
+      logit(p[i,j]) <- b0[j-1]
+      # + b_section[sectionmode[i]]
+      # + b_lengthcut[lengthcut[i]]
+      + b_length*length[i]
+      # + b_distday[dist_day[i]]
+      + b_distobs[dist_obs[i]]
+
+      # survtable_pp[i,j] ~ dbin(p[i,j], survtable[i,j-1])   ### this is included for pp check
+
+    }
+  }
+
+  for(j in 1:np) {
+    b0[j] ~ dnorm(0, 0.1)
+  }
+
+  # for(i_section in 1:(n_section-1)) {
+  #   b_section[i_section] ~ dnorm(0, 0.1)
+  # }
+  # b_section[n_section] <- -sum(b_section[1:(n_section-1)])
+
+  # for(i_length in 1:(n_length-1)) {
+  #   b_lengthcut[i_length] ~ dnorm(0, 0.1)
+  # }
+  # b_lengthcut[n_length] <- -sum(b_lengthcut[2:(n_length-1)])
+
+  b_length ~ dnorm(0, 0.1)
+
+  # for(i_distday in 1:(n_dist_day-1)) {
+  #   b_distday[i_distday] ~ dnorm(0, 0.1)
+  # }
+  # b_distday[n_dist_day] <- -sum(b_distday[1:(n_dist_day-1)])
+
+  for(i_distobs in 1:(n_dist_obs-1)) {
+    b_distobs[i_distobs] ~ dnorm(0, 0.1)
+  }
+  b_distobs[n_dist_obs] <- -sum(b_distobs[1:(n_dist_obs-1)])
+
+}', file=surv_vbls_jags)
+
+{
+  # tstart <- Sys.time()
+  # print(tstart)
+  surv_vbls_jags_out <- jagsUI::jags(model.file=surv_vbls_jags, data=surv_vbls_data,
+                                     parameters.to.save=c("p","b0","b_section","b_length","b_lengthcut",
+                                                          "b_distday","b_distobs",
+                                                          "survtable_pp"), #"survtable",
+                                     n.chains=ncores, parallel=T, n.iter=niter,
+                                     n.burnin=niter/2, n.thin=niter/2000)
+  # print(Sys.time() - tstart)
+
+  # par(mfrow=c(3,3))
+  # plotRhats(surv_vbls_jags_out)
+  # traceworstRhat(surv_vbls_jags_out)
+}
+```
+
+\pagebreak
+  
+### Okay, so what can we show??
+
+#### Baseline survival per time period
+
+First, here are plots of the baseline log-odds of survival associated with each pair of surveys, then expressed on the probability scale.  This might say something interesting, and it might not.
+
+Light bars represent 95% credible intervals, heavy bars represent 50% credible intervals.  Horizontal ticks represent posterior medians.
+
+```{r, fig.width=10, fig.height=4.5}
+par(mfrow=c(1,2))
+surveys <- sort(unique(flight_data$Survey))
+# xax <- paste(surveys[-length(surveys)], "to", surveys[-1])
+xax <- paste0(surveys[-length(surveys)], "-", surveys[-1])
+caterpillar(surv_vbls_jags_out, p="b0", main="baseline log-odds", xax=xax, las=2)
+grid(nx=NA,ny=NULL, col=adjustcolor(1,alpha.f=.2))
+caterpillar(expit(surv_vbls_jags_out$sims.list$b0), main="baseline probabilities", ylim=0:1, xax=xax)
+grid(nx=NA,ny=NULL, col=adjustcolor(1,alpha.f=.2))
+```
+
+#### Effect of length
+
+Next, the effect of length.  It should be noted that the effect of length was treated as a linear relationship with the log-odds of survival; nonlinearity was also explored by expressing length as a (binned) categorical variable, but the linear relationship was found to be preferable.
+
+Exponentiating the length effect, we can estimate a `r 100*(round(exp(surv_vbls_jags_out$q50$b_length) - 1, 3))`% increase in survival odds for every 1mm increase in length, after accounting for the effects of time period and magnitude of migratory behavior, with a 95% credible interval of `r 100*(round(exp(surv_vbls_jags_out$q2.5$b_length) - 1, 3))`% to `r 100*(round(exp(surv_vbls_jags_out$q97.5$b_length) - 1, 3))`%, and a `r 100*round(mean(surv_vbls_jags_out$sims.list$b_length>0),4)`% posterior probability that this effect is greater than zero.
+
+```{r, fig.width=10, fig.height=3.5}
+par(mfrow=c(1,2))
+plotdens(surv_vbls_jags_out, p="b_length", exact=T, main="length effect on log-odds")
+abline(v=0, lty=2)
+plotdens(exp(surv_vbls_jags_out$sims.list$b_length), main="length effect on odds")
+abline(v=1, lty=2)
+```
+
+#### Effect of migratory behavior
+
+Finally, the effect of migratory behavior.  This was quantified as the total distance observed for each instrumented grayling, divided by the number of associated observations minus one, thereby giving the number of possible movement intervals.  This was then binned as:
+
+* 0-25 rkm/interval
+* 25-50 rkm/interval
+* 50-100 rkm/interval
+* 100+ rkm/interval
+
+Effects are shown below, on the scale of log-odds and odds.
+
+```{r, fig.width=10, fig.height=5}
+par(mfrow=c(1,2))
+surveys <- sort(unique(flight_data$Survey))
+# xax <- paste(surveys[-length(surveys)], "to", surveys[-1])
+xax <- paste0(surveys[-length(surveys)], "-", surveys[-1])
+caterpillar(surv_vbls_jags_out, p="b_distobs", main="migratory effect on log-odds", xlab="migratory category")
+grid(nx=NA,ny=NULL, col=adjustcolor(1,alpha.f=.2))
+abline(h=0, lty=2)
+caterpillar(exp(surv_vbls_jags_out$sims.list$b_distobs), main="migratory effect on odds", xlab="migratory category")
+grid(nx=NA,ny=NULL, col=adjustcolor(1,alpha.f=.2))
+abline(h=1, lty=2)
+```
+
+Exponentiating the effects, we can estimate that fish moving 25-50 rkm per interval had a `r 100*round(exp(surv_vbls_jags_out$q50$b_distobs[2]) - 1, 3)`% greater odds of survival than baseline (95% CI of `r 100*round(exp(surv_vbls_jags_out$q2.5$b_distobs[2]) - 1, 3)`% - `r 100*round(exp(surv_vbls_jags_out$q97.5$b_distobs[2]) - 1, 3)`% greater), after accounting for the effects of time period and length.  Interestingly, we can also estimate that fish moving 100+ rkm per interval had a `r 100*round(1 - exp(surv_vbls_jags_out$q50$b_distobs[4]), 3)`% lower odds of survival than baseline (95% CI of `r 100*round(1 - exp(surv_vbls_jags_out$q97.5$b_distobs[4]), 3)`% - `r 100*round(1-exp(surv_vbls_jags_out$q2.5$b_distobs[4]), 3)`% less).
+
+Perhaps this suggests a balance between optimizing seasonally-available habitat and energy expenditure.  Fish that are able to find the sweet spot do well, as opposed to fish that stay put or migrate too much???
+
+\pagebreak
+
+### Okay, are these trends visible in the raw data??
+
+This can be a useful sanity check to validate results from an omnibus model.
+
+To that end, here's a sequence of plots of survival at each flight (0=dead, 1=alive).  Note that this incorporates logically-imputed information (dead fish stayed dead, living fish were presumed alive for all periods prior to observation).  Line plots express surviving proportion where applicable.
+
+#### All fish
+
+```{r, fig.width=11, fig.height=6}
+par(mfrow=c(1,1))
+mosaicplot(make_tottable(surv), main="all fish")
+```
+
+#### Separated by location most observed (not used in model)
+
+```{r, fig.width=11, fig.height=6}
+par(mfrow=c(2,3))
+makeplotswith(x=loc3_id)
+```
+
+#### Separated by length (model used this as numeric rather than categorical)
+
+```{r, fig.width=11, fig.height=6}
+par(mfrow=c(2,3))
+makeplotswith(x=cut(length_id, breaks=c(310,330,350,370,430)))
+```
+
+#### Separated by distance per observation interval
+
+```{r, fig.width=11, fig.height=6}
+par(mfrow=c(2,3))
+makeplotswith(x=cut(dtab$dist_per_obs, breaks=c(0,25,50,100,200)))
+```
