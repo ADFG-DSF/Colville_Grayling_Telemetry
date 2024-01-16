@@ -1,19 +1,34 @@
+### This script is broken into two principal sections.
+
+### + The first contains April Behr's analysis, which is used in the current FDS draft.
+###   - MT modification: file paths are changed as necessary for repo file structure
+###   - MT modification: code writing output to external files (.jpg, .csv) is commented out
+
+### + The second contains some supplemental analysis by Matt Tyers (Jan 2024)
+###   - Implementing a new visualization, linking sequential observations by line segments on map
+###   - Visualizing survival data, and relationships with individual-level variables
+###   - Applying a Bayesian survival model to explore such relationships
+###   - verifying some of the proportions presented in the FDS draft
+
+
+
 ##Colville Arctic Grayling Telemetry 2019-2022##===========================
 #April Behr
 #December 26, 2023
 
 #Setwd()
 # setwd("C:/Users/aebehr/Documents/REPORTS/RESIDENT SPECIES/Colville GR 2019-2022/Colville_analysis_ab")
+
 wd <- getwd()
 
 
 #Define location of data--------------------------------------------------------
-dir.data <- file.path(wd, "data")
+dir.data <- file.path(wd, "Colville_analysis_ab/data")
 dir.data
 
 
 #Define location of analysis output --------------------------------------------
-dir.analysis <- file.path(wd, "analysis output")
+dir.analysis <- file.path(wd, "Colville_analysis_ab/analysis output")
 dir.analysis
 
 
@@ -73,7 +88,7 @@ unique(flight_data$Use)
 # save(Colville2, file = "Colville2.rda")
 
 #Load saved river shape
-load(file="Colville2.rda")
+load(file="Colville_analysis_ab/Colville2.rda")
 
 
 #Project flight data and plot it------------------------------------------------
@@ -505,15 +520,29 @@ row.names(hr_table) <- c("Winter 2020 - Winter 2021",
 
 
 
-#### MT addition 1/8/2024
-save(flight_data, Colville4, file="flight_data.Rdata")
+
+
+
+
+
+
+
+
+#### MT additions 1/8/2024 ------------------------------------------------------------
+
+### First, developing a plotting method to link sequential observations with line
+### segments on a map, color-coded such that net downstream movement is red
+### and net upstream movement is blue.
+
+
+# save(flight_data, Colville4, file="flight_data.Rdata")  # for the .Rmd file
 
 ## lineplot, linked by paired observations
 # flight_data has all the things
 # telem_albers has raw xy telemetry data
 
 # defining function to extract xy coords from seg-vert(river)
-# might include this in riverdist
+# (might include this in riverdist!)
 segvert2xy <- function(seg, vert, rivers) {
   if (!inherits(rivers, "rivernetwork"))
     stop("Argument 'rivers' must be of class 'rivernetwork'.  See help(line2network) for more information.")
@@ -528,29 +557,24 @@ segvert2xy <- function(seg, vert, rivers) {
   }
   return(data.frame(x=x,y=y))
 }
+
+# using the function above to extract XY coordinates from river locations
 the_xy <- segvert2xy(seg=flight_data$seg, vert=flight_data$vert, rivers=Colville4)
 flight_data$x <- the_xy$x
 flight_data$y <- the_xy$y
 flight_data$md <- mouthdist(seg=flight_data$seg, vert=flight_data$vert, rivers=Colville4)
 
+# creating tables of X, Y, and (distance from mouth) associated with each survey
+# note that is is in wide-format, with a column for each survey
 x_wider <- pivot_wider(flight_data, names_from = Survey, values_from=x, id_cols=`Unique..`) %>% as.data.frame
 y_wider <- pivot_wider(flight_data, names_from = Survey, values_from=y, id_cols=`Unique..`) %>% as.data.frame
 md_wider <- pivot_wider(flight_data, names_from = Survey, values_from=md, id_cols=`Unique..`) %>% as.data.frame
 
-# actually doing the paired thing
+
+# Using the wide-format tables to actually create the paired plots described above
 allsurveys <- sort(unique(flight_data$Survey))
 par(mfrow=c(2,4))
 for(i_survey in 2:length(allsurveys)) {
-  # x0 <- flight_data$x[flight_data$Survey==allsurveys[i_survey-1]]
-  # y0 <- flight_data$y[flight_data$Survey==allsurveys[i_survey-1]]
-  # x1 <- flight_data$x[flight_data$Survey==allsurveys[i_survey]]
-  # y1 <- flight_data$y[flight_data$Survey==allsurveys[i_survey]]
-
-  # x0 <- ifelse(flight_data$Survey==allsurveys[i_survey-1], flight_data$x, NA)
-  # y0 <- ifelse(flight_data$Survey==allsurveys[i_survey-1], flight_data$y, NA)
-  # x1 <- ifelse(flight_data$Survey==allsurveys[i_survey], flight_data$x, NA)
-  # y1 <- ifelse(flight_data$Survey==allsurveys[i_survey], flight_data$y, NA)
-
   x0 <- x_wider[,i_survey]
   x1 <- x_wider[,i_survey+1]
   y0 <- y_wider[,i_survey]
@@ -573,12 +597,15 @@ for(i_survey in 2:length(allsurveys)) {
 }
 
 
-
-## survival proportions(ish) by location somehow??
-## survival proportions(ish) by size(ish)??
+#### The next section was mostly intended to summarize survival, and to explore
+#### the effects of a number of variables on survival probability
 
 # Making a wide-format table for all these variables:
-# Length Tagging_Location Located_1 Located_2 Located_3
+# - Length 
+# - Tagging_Location 
+# - Located_1 
+# - Located_2 
+# - Located_3
 length_wider <- pivot_wider(flight_data, names_from = Survey, values_from=Length, id_cols=`Unique..`) %>% as.data.frame
 tag_wider <- pivot_wider(flight_data, names_from = Survey, values_from=Tagging_Location, id_cols=`Unique..`) %>% as.data.frame
 loc1_wider <- pivot_wider(flight_data, names_from = Survey, values_from=Located_1, id_cols=`Unique..`) %>% as.data.frame
@@ -588,6 +615,7 @@ loc3_wider <- pivot_wider(flight_data, names_from = Survey, values_from=Located_
 # defining a function to extract the mode of a vector
 themode <- function(x) unname(names(sort(table(x), decreasing=T))[1])
 
+## Defining vectors corresponding to all tagged individuals
 # grabbing the mode of all the _wider rows
 # this will make a vector corresponding to all tagged individuals
 length_id <- length_wider[,2]
@@ -595,6 +623,9 @@ tag_id <- apply(tag_wider, 1, function(x) themode(as.character(x)[-1]))
 loc1_id <- apply(loc1_wider, 1, function(x) themode(as.character(x)[-1]))
 loc2_id <- apply(loc2_wider, 1, function(x) themode(as.character(x)[-1]))
 loc3_id <- apply(loc3_wider, 1, function(x) themode(as.character(x)[-1]))
+
+
+### Next, defining some variables from migratory behavior
 
 # will need by-indiv vectors of migratory behavior:
 # might even restrict this to the first 4(ish) events??
@@ -623,7 +654,7 @@ riverpoints(seg=flight_data$seg[flight_data$Unique..==65],
             rivers=Colville4, pch=16)
 
 
-
+### The section below is copied almost directly from the Tanana Burbot analysis
 
 ## what if we did total observed distance INSTEAD of homerange?
 ## this is defined as the absolute distance between each possible pairing of
@@ -678,7 +709,7 @@ dtab$homerange <- 0
 for(i in 1:nrow(hr_table)) dtab$homerange[rownames(dtab)==hr_table$ID[i]] <- hr_table$range[i]
 
 
-# start plotting stuff!
+# some exploratory plots!
 par(mfrow=c(2,2))
 plot(dtab$homerange ~ length_id)
 plot(dtab$cumuldist ~ length_id)
@@ -713,6 +744,13 @@ boxplot(dtab$cumuldist ~ loc3_id, las=2, xlab="")
 boxplot(dtab$dist_per_obs ~ loc3_id, las=2, xlab="")
 boxplot(dtab$dist_per_day ~ loc3_id, las=2, xlab="")
 
+
+### Creating a survival matrix 
+### - rows are individual fish
+### - columns are surveys
+### - 0=dead, 1=alive, NA=unknown
+### Also imputing values when state can be logically inferred
+
 # will also need survival matrix
 # AND fixed survival matrix
 status_wider <- pivot_wider(flight_data, names_from = Survey, values_from=Status, id_cols=`Unique..`) %>% as.data.frame
@@ -730,6 +768,9 @@ for(i in 1:nrow(surv)) {
   if(length(which0) > 0) surv[i, min(which0):ncol(surv)] <- 0
 }
 
+
+### Plotting raw survival data
+
 make_tottable <- function(x) {
   # t(apply(x,2,table))#, useNA="ifany"))
   mat <- matrix(ncol=2, nrow=ncol(x))
@@ -744,6 +785,9 @@ make_tottable <- function(x) {
 par(mfrow=c(1,1))
 mosaicplot(make_tottable(surv), main="all fish")
 
+
+# defining a function to produce plots of raw survival data,
+# but separated by a single explanatory variable
 makeplotswith <- function(x) {
   surv <- surv[!is.na(x),]
   x <- x[!is.na(x)]
@@ -764,6 +808,7 @@ makeplotswith <- function(x) {
   legend("topright", lwd=2, col=1:length(unique(x)), legend=sort(unique(x)))
 }
 
+# making plots of survival data, as related to explanatory variables
 par(mfrow=c(2,3))
 makeplotswith(x=loc3_id)
 par(mfrow=c(2,3))
@@ -796,11 +841,15 @@ mosaicplot(table(loc3_id, cut(dtab$dist_per_day, breaks=c(0,.2,.4,.6,1))),
 # mosaicplot(table(tag_id, cut(dtab$dist_per_day, breaks=c(0,.2,.4,.6,1))))
 
 
+
+
+#### Applying the Bayesian survival analysis developed for the Tanana Burbot project
+
 ## survival model, motivated by above
 library(jagsUI)
 library(jagshelper)
 
-# still need firstdead
+# defining a data input expressing the first survey an individual is observed to be dead
 firstdead <- rep(NA, nrow(surv))
 for(i in 1:nrow(surv)) {
   firstdead[i] <- ifelse(!any(surv[i,]==0, na.rm=T),
@@ -814,7 +863,11 @@ dist_obs <- cut(dtab$dist_per_obs, breaks=c(0,25,50,100,200))
 dist_day <- cut(dtab$dist_per_day, breaks=c(0,.2,.4,.6,1))
 sectionmode <- loc3_id
 
+
 ### TRYING A MORE STRUCTURED APPROACH TO MODEL SELECTION
+### - data is bundled once, and several variations of the model are fit
+### - in which relevant components are turned on/off with comments
+
 # bundle data to pass into JAGS
 surv_vbls_data <- list(survtable=surv,
                        firstdead=firstdead,
@@ -1387,10 +1440,16 @@ cat('model {
 jagsouts[[8]] <- surv_vbls_jags_out
 
 
+
+#### COMPARISON OF ALL MODELS!!
+
+# Comparing DIC scores of all models (model 8 is best)
 sapply(jagsouts, function(x) x$DIC)
 # [1] 304.3466 309.0419 304.1840 302.1355 308.6036 300.7047   # keeping ALL priors
 # [1] 305.0627 309.2201 304.2258 302.1256 308.6323 300.3952 300.1507 296.9016   # excluding priors
 
+
+# Graphically comparing inferences for all models
 par(mfrow=c(2,2))
 caterpillar(jagsouts[[1]], p="b0", main="baseline log-odds")
 caterpillar(expit(jagsouts[[1]]$sims.list$b0), main="baseline probabilities", ylim=0:1)
@@ -1578,7 +1637,7 @@ onoffs[which.min(sapply(newjagsouts, function(x) x$DIC)),]
 
 
 
-#### verifying proportions in report
+#### Finally, verifying proportions in report if possible
 
 sum(tag_id=="Nuiqsut")  # 51
 sum(tag_id=="Nuiqsut") - sum(tag_id=="Nuiqsut" & status_wider$`3`=="A", na.rm=T) # 23
